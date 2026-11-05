@@ -377,9 +377,12 @@ def extract_competitors(text):
 # lurk demand boards, so competition is near zero by construction. See DISCOVERY.md.
 # --------------------------------------------------------------------------
 def source_github_issues(cfg=None):
-    q = ('label:help-wanted state:open type:issue -linked:pr -assigned '
+    # lesson from the first live run: `-assigned` is not a valid search
+    # qualifier and silently poisons the whole query (0 hits / 422);
+    # `no:assignee` is the correct form.
+    q = ('label:help-wanted state:open type:issue -linked:pr '
          'no:assignee created:>={since}').format(
-             since=time.strftime("%Y-%m-%d", time.localtime(now() - 14 * 86400)))
+             since=time.strftime("%Y-%m-%d", time.localtime(now() - 30 * 86400)))
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "earnloop"}
     tok = cfg or os.environ.get("GITHUB_TOKEN")
     if tok:
