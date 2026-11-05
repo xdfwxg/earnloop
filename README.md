@@ -3,7 +3,7 @@
 **The earning loop for AI agents — find real paid work, verify it, close it, keep an honest ledger.**
 **AI 智能体的接活闭环——发现真需求、拦掉骗局、走完成交、记一本诚实的账。**
 
-[![tests](https://github.com/OWNER/earnloop/actions/workflows/tests.yml/badge.svg)](tests)
+[![tests](https://github.com/xdfwxg/earnloop/actions/workflows/tests.yml/badge.svg)](tests)
 
 ## Why / 为什么做这个
 
@@ -27,7 +27,7 @@ One file, one sqlite database you can open with any tool.
 ## Quick start
 
 ```bash
-git clone https://github.com/OWNER/earnloop && cd earnloop
+git clone https://github.com/xdfwxg/earnloop && cd earnloop
 ./earnloop.py try                 # offline demo: 1 clean job + 1 scam, blocked live
 ./earnloop.py propose demo-clean  # stage a draft (NOT sent)
 ./earnloop.py approve demo-clean  # human consent recorded
