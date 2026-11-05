@@ -8,10 +8,11 @@ an honest ledger. Zero dependencies: Python 3.8+ stdlib only.
 
     earnloop scan                 pull opportunities from every enabled source
     earnloop propose <id>         stage an outreach draft (never sends by itself)
-    earnloop approve <id>         approve a staged proposal (human consent)
+    earnloop approve <id>         approve a staged proposal (approver key REQUIRED)
     earnloop mark <id> <state>    sent / won / lost / needs-human
-    earnloop record <item> <amt>  write a ledger entry (evidence REQUIRED)
-    earnloop verify <ledger-id>   mark money actually received (evidence REQUIRED)
+    earnloop followup <id>        record a follow-up (3 no-replies → needs-human)
+    earnloop record <item> <amt> --opp <id>   ledger entry (evidence REQUIRED)
+    earnloop verify <ledger-id>   money received (approver key + evidence REQUIRED)
     earnloop why <id>             full trace of one opportunity (event journal)
     earnloop stats                per-source win rates (feedback into scoring)
     earnloop pause / resume       kill switch: block new outreach, keep inspection
@@ -26,6 +27,8 @@ Design rules (learned the hard way):
   3. Nothing leaves the machine without a human approval record.
   4. Scam patterns live in SCAMS.md and are enforced in code, not in docs.
   5. Delivered is not paid. Money is counted only with payment evidence.
+  6. Consent only counts as human if the approver key lives outside the agent's
+     environment. A shell-running agent can type any command — not that key.
 
 Ideas absorbed from the ecosystem (credit where due):
   - KKKKhazix/agent-autoloop: append-only event journal + `why` trace
@@ -35,6 +38,7 @@ Ideas absorbed from the ecosystem (credit where due):
   - Autoloops/upskill:       source feedback loop; outbound secret scanning
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -43,11 +47,20 @@ import sys
 import time
 import urllib.request
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 HOME = os.environ.get("EARNLOOP_HOME") or os.path.expanduser("~/.earnloop")
 DB_PATH = os.path.join(HOME, "earnloop.db")
 JOURNAL_PATH = os.path.join(HOME, "events.jsonl")
 PAUSE_FLAG = os.path.join(HOME, "PAUSED")
+
+# The approver key belongs in the human's own shell profile. It is deliberately
+# NOT read from any config file this tool writes, so an agent that can run
+# `earnloop` still cannot manufacture a human approval.
+APPROVER_KEY_ENV = "EARNLOOP_APPROVER_KEY"
+
+# demand source credentials live outside the repo, path configurable
+BOTSTREET_ENV = (os.environ.get("EARNLOOP_BOTSTREET_ENV")
+                 or os.path.join(HOME, "botstreet.env"))
 
 # watchdog ceilings (lesson from mcp-session-share: server-clamped limits,
 # not agent-honored promises)
@@ -107,6 +120,48 @@ def secret_check(text):
 
 
 # --------------------------------------------------------------------------
+# human identity + evidence — the two things an agent must not be able to fake
+# (aegisflow lesson: authority and evidence live outside the model's process)
+# --------------------------------------------------------------------------
+EVIDENCE_RE = re.compile(r"^(shot|tx|file|url):\s*(\S.{2,})$")
+
+
+def approver_identity():
+    """Return an identity string for the human approver, or None if no key."""
+    key = os.environ.get(APPROVER_KEY_ENV, "").strip()
+    if not key:
+        return None
+    return "human:" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+
+
+def require_human(action):
+    """Refuse to record consent that the agent itself could have produced."""
+    who = approver_identity()
+    if not who:
+        sys.exit("blocked: `%s` records human consent, so it needs %s set in YOUR "
+                 "shell (not in the agent's environment). "
+                 "export %s=\"<a phrase only you know>\" then retry."
+                 % (action, APPROVER_KEY_ENV, APPROVER_KEY_ENV))
+    return who
+
+
+def check_evidence(evidence, kind):
+    """Evidence must be a reference someone else can re-check, not a claim."""
+    if not evidence:
+        sys.exit("blocked: --evidence is REQUIRED for %s "
+                 "(e.g. `tx: alipay 20261105…`, `shot: ./delivery.png`). "
+                 "No evidence, no record — self-reported facts are fiction." % kind)
+    m = EVIDENCE_RE.match(evidence.strip())
+    if not m:
+        sys.exit("blocked: evidence must name a scheme so it can be re-checked — "
+                 "shot: / tx: / file: / url:. got: %r" % evidence)
+    scheme, ref = m.group(1), m.group(2).strip()
+    if scheme == "file" and not os.path.exists(os.path.expanduser(ref)):
+        sys.exit("blocked: evidence file does not exist: %s" % ref)
+    return evidence.strip()
+
+
+# --------------------------------------------------------------------------
 # event journal — append-only, one JSON object per line (autoloop lesson:
 # any round's history must be answerable with one command)
 # --------------------------------------------------------------------------
@@ -148,10 +203,15 @@ def proposals_today():
     return n
 
 
-def guard_outreach(action, opp_id):
-    """Kill switch + watchdog gate. Blocks outreach, never inspection."""
+def guard_paused():
+    """Kill switch. Blocks every path that can reach a human, never inspection."""
     if os.path.exists(PAUSE_FLAG):
         sys.exit("blocked: kill switch is ON (PAUSED). run `earnloop resume` first.")
+
+
+def guard_outreach(action, opp_id):
+    """Kill switch + watchdog gate, for paths that allocate a NEW outreach."""
+    guard_paused()
     if proposals_today() >= MAX_PROPOSALS_PER_DAY:
         journal_write("watchdog_block", opp_id,
                       "daily cap %d reached" % MAX_PROPOSALS_PER_DAY)
@@ -177,12 +237,13 @@ def db():
         );
         CREATE TABLE IF NOT EXISTS ledger(
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL,
+            opportunity_id TEXT,
             item TEXT, amount REAL, currency TEXT, status TEXT,
             note TEXT, evidence TEXT
         );
         CREATE TABLE IF NOT EXISTS approvals(
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL,
-            opportunity_id TEXT, action TEXT, decided_by TEXT DEFAULT 'human'
+            opportunity_id TEXT, action TEXT, decided_by TEXT
         );
         """
     )
@@ -193,6 +254,10 @@ def db():
         pass
     try:
         conn.execute("ALTER TABLE opportunities ADD COLUMN last_note TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE ledger ADD COLUMN opportunity_id TEXT")
     except sqlite3.OperationalError:
         pass
     conn.commit()
@@ -253,7 +318,7 @@ def apply_source_feedback(score, stats):
 # --------------------------------------------------------------------------
 def source_botstreet(cfg_path=None):
     cfg = {}
-    path = cfg_path or os.path.expanduser("~/打工/chihiro-agent/accounts/botstreet.env")
+    path = cfg_path or BOTSTREET_ENV
     if not os.path.exists(path):
         return []
     for line in open(path, encoding="utf-8"):
@@ -364,12 +429,26 @@ def cmd_approve(args):
         sys.exit("no such opportunity: %s" % args.id)
     if not row["staged_at"]:
         sys.exit("propose first: earnloop propose %s" % args.id)
+    if row["approved_at"]:
+        sys.exit("already approved at %s — refusing to double-count consent."
+                 % time.strftime("%F %T", time.localtime(row["approved_at"])))
+    who = require_human("approve")      # identity first: nothing is journaled on a failed attempt
     guard_outreach("approved", args.id)
     conn.execute("UPDATE opportunities SET approved_at=? WHERE id=?", (now(), args.id))
-    conn.execute("INSERT INTO approvals(ts,opportunity_id,action) VALUES(?,?,?)",
-                 (now(), args.id, "approved_by_human"))
+    conn.execute("INSERT INTO approvals(ts,opportunity_id,action,decided_by) VALUES(?,?,?,?)",
+                 (now(), args.id, "approved_by_human", who))
     conn.commit()
-    print("approved by human at %s. The agent may now send via the channel plugin." % time.strftime("%F %T"))
+    print("approved by %s at %s. The agent may now send via the channel plugin."
+          % (who, time.strftime("%F %T")))
+
+
+# a deal may not walk backwards, and `sent` is the one transition that reaches
+# a real person — so it needs both the kill switch and a recorded approval
+ALLOWED_TRANSITIONS = {
+    "open": {"sent"},
+    "sent": {"won", "lost", "needs-human"},
+    "needs-human": {"won", "lost"},
+}
 
 
 def cmd_mark(args):
@@ -381,6 +460,19 @@ def cmd_mark(args):
     row = conn.execute("SELECT * FROM opportunities WHERE id=?", (args.id,)).fetchone()
     if not row:
         sys.exit("no such opportunity: %s" % args.id)
+    current = row["outcome"] or "open"
+    allowed = ALLOWED_TRANSITIONS.get(current, set())
+    if args.state not in allowed:
+        sys.exit("blocked: %s → %s is not a legal transition (from `%s` allowed: %s)"
+                 % (current, args.state, current,
+                    ", ".join(sorted(allowed)) or "none — won/lost are terminal"))
+    if args.state == "sent":
+        if not row["approved_at"]:
+            journal_write("blocked_unapproved_send", args.id)
+            sys.exit("blocked: %s has no human approval on record. `mark sent` is the "
+                     "moment the draft reaches a real person — run `earnloop approve %s` first."
+                     % (args.id, args.id))
+        guard_paused()
     conn.execute("UPDATE opportunities SET outcome=?, sent_at=CASE WHEN ?='sent' THEN ? ELSE sent_at END WHERE id=?",
                  (args.state, args.state, now(), args.id))
     journal_write("marked", args.id, args.state)
@@ -393,6 +485,10 @@ def cmd_followup(args):
     row = conn.execute("SELECT * FROM opportunities WHERE id=?", (args.id,)).fetchone()
     if not row:
         sys.exit("no such opportunity: %s" % args.id)
+    guard_paused()          # a follow-up contacts a human: the kill switch must cover it
+    if (row["outcome"] or "open") != "sent":
+        sys.exit("blocked: %s is in state `%s` — follow-ups only apply to `sent`."
+                 % (args.id, row["outcome"] or "open"))
     attempts = (row["attempts"] or 0) + 1
     note = args.note or ("no-reply" if args.no_reply else "reply")
     outcome = row["outcome"]
@@ -411,37 +507,46 @@ def cmd_followup(args):
 
 def cmd_record(args):
     """aegisflow lesson: the model does not self-report money. A ledger entry
-    cannot exist without delivery evidence."""
-    if not args.evidence:
-        sys.exit("blocked: --evidence is REQUIRED (screenshot path / tx ref). "
-                 "No evidence, no ledger entry — self-reported income is fiction.")
+    cannot exist without delivery evidence, and cannot exist without a deal."""
+    if not args.opp:
+        sys.exit("blocked: --opp is REQUIRED — money that belongs to no deal is not "
+                 "a ledger entry, it is a story.")
+    evidence = check_evidence(args.evidence, "record")
     conn = db()
+    if not conn.execute("SELECT id FROM opportunities WHERE id=?", (args.opp,)).fetchone():
+        sys.exit("no such opportunity: %s" % args.opp)
     cur = conn.execute(
-        "INSERT INTO ledger(ts,item,amount,currency,status,note,evidence) VALUES(?,?,?,?,?,?,?)",
-        (now(), args.item, args.amount, args.currency, "pending-verify", args.note or "", args.evidence))
-    journal_write("recorded", None, "ledger#%d %s %.2f" % (cur.lastrowid, args.item, args.amount))
+        "INSERT INTO ledger(ts,opportunity_id,item,amount,currency,status,note,evidence)"
+        " VALUES(?,?,?,?,?,?,?,?)",
+        (now(), args.opp, args.item, args.amount, args.currency, "pending-verify",
+         args.note or "", evidence))
+    journal_write("recorded", args.opp,
+                  "ledger#%d %s %.2f" % (cur.lastrowid, args.item, args.amount))
     conn.commit()
-    print("ledger#%d recorded as pending-verify. Money counts only after `earnloop verify %d`."
-          % (cur.lastrowid, cur.lastrowid))
+    print("ledger#%d recorded against %s as pending-verify. Money counts only after "
+          "`earnloop verify %d`." % (cur.lastrowid, args.opp, cur.lastrowid))
 
 
 def cmd_verify(args):
     """autoloop-old lesson: delayed verification. Delivered ≠ paid."""
+    who = require_human("verify")       # payment confirmation is a human fact
+    evidence = check_evidence(args.evidence, "verify")
     conn = db()
     row = conn.execute("SELECT * FROM ledger WHERE id=?", (args.ledger_id,)).fetchone()
     if not row:
         sys.exit("no such ledger entry: %d" % args.ledger_id)
     if row["status"] == "paid":
         sys.exit("already verified (paid) — refuse to double-count.")
-    if not args.evidence:
-        sys.exit("blocked: --evidence is REQUIRED (payment tx id / screenshot). "
-                 "The agent's own claim that money arrived is not evidence.")
+    merged = "%s | paid: %s" % (row["evidence"] or "-", evidence)
     conn.execute("UPDATE ledger SET status='paid', evidence=?, note=? WHERE id=?",
-                 (args.evidence, (row["note"] + " | verified: " + (args.note or "")).strip(" |"),
+                 (merged, (row["note"] + " | verified: " + (args.note or "")).strip(" |"),
                   args.ledger_id))
-    journal_write("verified", None, "ledger#%d paid %.2f %s" % (args.ledger_id, row["amount"], row["currency"]))
+    journal_write("verified", row["opportunity_id"],
+                  "ledger#%d paid %.2f %s by %s" % (args.ledger_id, row["amount"],
+                                                    row["currency"], who))
     conn.commit()
-    print("ledger#%d verified as PAID with evidence. The honest total just moved." % args.ledger_id)
+    print("ledger#%d verified as PAID by %s (opportunity %s). The honest total just moved."
+          % (args.ledger_id, who, row["opportunity_id"] or "unlinked"))
 
 
 def cmd_why(args):
@@ -456,6 +561,17 @@ def cmd_why(args):
         print("  title: %s" % opp["title"])
         if opp["scams"] not in ("[]", "", None):
             print("  scams: %s" % opp["scams"])
+        money = conn.execute(
+            "SELECT id,amount,currency,status,evidence FROM ledger"
+            " WHERE opportunity_id=? ORDER BY ts", (args.id,)).fetchall()
+        if money:
+            print("  money: %d ledger entr%s" % (len(money), "y" if len(money) == 1 else "ies"))
+            for m in money:
+                print("    ledger#%-4d %8.2f %s  %-14s ev:%s"
+                      % (m["id"], m["amount"], m["currency"], m["status"],
+                         (m["evidence"] or "")[:40]))
+        else:
+            print("  money: none recorded against this deal yet")
     else:
         print("(not in db: %s)" % args.id)
     if not rows:
@@ -480,7 +596,8 @@ def cmd_pause(args):
     os.makedirs(HOME, exist_ok=True)
     open(PAUSE_FLAG, "w").write(time.strftime("%F %T"))
     journal_write("paused")
-    print("kill switch ON — propose/approve/mark are blocked; status/ledger/why still work.")
+    print("kill switch ON — propose/approve/followup/mark-sent are blocked; "
+          "inspection (status/ledger/why/doctor) still works.")
 
 
 def cmd_resume(args):
@@ -494,7 +611,12 @@ def cmd_resume(args):
 
 def cmd_doctor(args):
     checks = []
-    checks.append(("home writable", os.access(HOME if os.path.exists(HOME) else os.path.dirname(HOME) or "/", os.W_OK) or os.makedirs(HOME, exist_ok=True) is None))
+    try:
+        os.makedirs(HOME, exist_ok=True)
+        writable = os.access(HOME, os.W_OK)
+    except OSError:
+        writable = False
+    checks.append(("home writable (%s)" % HOME, writable))
     try:
         conn = db()
         conn.execute("SELECT 1 FROM opportunities LIMIT 1").fetchall()
@@ -506,16 +628,18 @@ def cmd_doctor(args):
     for name in SOURCES:
         src_ok = True
         if name == "botstreet":
-            src_ok = os.path.exists(os.path.expanduser("~/打工/chihiro-agent/accounts/botstreet.env"))
+            src_ok = os.path.exists(BOTSTREET_ENV)
         checks.append(("source %s configured" % name, src_ok))
-    checks.append(("daily cap", "cap=%d escalation=%d" % (MAX_PROPOSALS_PER_DAY, FOLLOWUP_ESCALATION) and True))
+    checks.append(("approver key (%s)" % APPROVER_KEY_ENV, approver_identity() is not None))
     bad = 0
     for name, ok in checks:
         mark = "OK " if ok is True else ("WARN" if name == "paused" and ok is False else "FAIL")
         if ok is False and name != "paused":
             bad += 1
         print("[%s] %s%s" % (mark, name, (" — %s" % ok) if isinstance(ok, str) else ""))
-    print("\n%d failure(s). " % bad + ("kill switch is ON." if os.path.exists(PAUSE_FLAG) else "kill switch off."))
+    print("\ncap: proposals/day=%d, follow-up escalation=%d"
+          % (MAX_PROPOSALS_PER_DAY, FOLLOWUP_ESCALATION))
+    print("%d failure(s). " % bad + ("kill switch is ON." if os.path.exists(PAUSE_FLAG) else "kill switch off."))
 
 
 def cmd_status(args):
@@ -549,8 +673,9 @@ def cmd_ledger(args):
     if not rows:
         print("(empty — every entry here is a real payment, never a promise)")
     for r in rows:
-        print("%s  #%-4d %-24s %8.2f %s  %-14s ev:%s" % (
-            time.strftime("%F", time.localtime(r["ts"])), r["id"], r["item"][:24],
+        print("%s  #%-4d %-14s %-24s %8.2f %s  %-14s ev:%s" % (
+            time.strftime("%F", time.localtime(r["ts"])), r["id"],
+            (r["opportunity_id"] or "-")[:14], r["item"][:24],
             r["amount"], r["currency"], r["status"], (r["evidence"] or "")[:20]))
     paid = conn.execute("SELECT SUM(amount) s FROM ledger WHERE status='paid'").fetchone()["s"] or 0
     pend = conn.execute("SELECT SUM(amount) s FROM ledger WHERE status='pending-verify'").fetchone()["s"] or 0
@@ -594,7 +719,8 @@ def main(argv=None):
     p = sub.add_parser("mark"); p.add_argument("id"); p.add_argument("state"); p.set_defaults(fn=cmd_mark)
     p = sub.add_parser("followup"); p.add_argument("id"); p.add_argument("--no-reply", action="store_true"); p.add_argument("--note"); p.set_defaults(fn=cmd_followup)
     p = sub.add_parser("record"); p.add_argument("item"); p.add_argument("amount", type=float)
-    p.add_argument("--currency", default="CNY"); p.add_argument("--note"); p.add_argument("--evidence"); p.set_defaults(fn=cmd_record)
+    p.add_argument("--opp", required=True); p.add_argument("--currency", default="CNY")
+    p.add_argument("--note"); p.add_argument("--evidence"); p.set_defaults(fn=cmd_record)
     p = sub.add_parser("verify"); p.add_argument("ledger_id", type=int); p.add_argument("--note"); p.add_argument("--evidence"); p.set_defaults(fn=cmd_verify)
     p = sub.add_parser("why"); p.add_argument("id"); p.set_defaults(fn=cmd_why)
     p = sub.add_parser("stats"); p.set_defaults(fn=cmd_stats)

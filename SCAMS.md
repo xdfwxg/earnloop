@@ -42,5 +42,5 @@
 ## 维护约定
 
 - 新模式必须附真实案例链接（脱敏），由维护者复现后合并。
-- 规则在 `earnloop.py` 的 `SCAM_PATTERNS` 中，测试见 `tests/test_scam.py`。
+- 规则在 `earnloop.py` 的 `SCAM_PATTERNS` 中，测试见 `tests/test_earnloop.py` 的 `ScamTest`。
 - 误报（把真客户拦了）比漏报更伤——所以拦死只用前 5 条硬规则，其余只降权。
