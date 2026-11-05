@@ -464,7 +464,10 @@ def cmd_propose(args):
     if json.loads(row["scams"] or "[]"):
         journal_write("blocked_scam", args.id, row["scams"])
         sys.exit("blocked: this opportunity matched scam patterns %s — see SCAMS.md" % row["scams"])
-    if row["source"] == "github-issues":
+    if args.draft:
+        # personalized draft supplied by the agent — still passes the same gates
+        draft = open(os.path.expanduser(args.draft), encoding="utf-8").read().strip()
+    elif row["source"] == "github-issues":
         draft = ("看到这个 issue。我可以接手修复：先给一个最小可复现/最小 patch 供你验证，"
                  "通过后再谈报酬；全程在公开仓库可见，验收不合格不收费。 %s") % row["url"]
     else:
@@ -785,7 +788,7 @@ def main(argv=None):
     ap.add_argument("--version", action="version", version=VERSION)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("scan"); p.add_argument("--sources"); p.add_argument("--top", type=int, default=10); p.set_defaults(fn=cmd_scan)
-    p = sub.add_parser("propose"); p.add_argument("id"); p.set_defaults(fn=cmd_propose)
+    p = sub.add_parser("propose"); p.add_argument("id"); p.add_argument("--draft", help="path to a personalized draft file"); p.set_defaults(fn=cmd_propose)
     p = sub.add_parser("approve"); p.add_argument("id"); p.set_defaults(fn=cmd_approve)
     p = sub.add_parser("mark"); p.add_argument("id"); p.add_argument("state"); p.set_defaults(fn=cmd_mark)
     p = sub.add_parser("followup"); p.add_argument("id"); p.add_argument("--no-reply", action="store_true"); p.add_argument("--note"); p.set_defaults(fn=cmd_followup)
