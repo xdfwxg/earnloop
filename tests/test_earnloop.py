@@ -86,6 +86,13 @@ class ScoreTest(unittest.TestCase):
     def test_competition_penalizes(self):
         self.assertGreater(el.score_opp("$100", "", 0), el.score_opp("$100", "", 20))
 
+    def test_competitors_actually_extracted(self):
+        """review lesson: competition must be measured, not a dead parameter."""
+        self.assertEqual(el.extract_competitors("已有12人认领，速来"), 12)
+        self.assertEqual(el.extract_competitors("5 bids so far"), 5)
+        self.assertEqual(el.extract_competitors("3 位已报名"), 3)
+        self.assertEqual(el.extract_competitors("无人投标"), 0)
+
     def test_source_feedback_gates(self):
         # upskill lesson: no history → no nudge; needs >=3 approved attempts
         base = 10.0
@@ -341,6 +348,43 @@ class LedgerTest(unittest.TestCase):
         self.assertIn("ledger#1", r.stdout)
         self.assertIn("150.00", r.stdout)
         self.assertIn("pending-verify", r.stdout)
+
+
+class DiscoveryTest(unittest.TestCase):
+    """the low-competition door: github-issues source + its own draft voice."""
+
+    def test_issue_draft_and_agent_attribution(self):
+        import shutil, sqlite3, tempfile
+        tmp = tempfile.mkdtemp()
+        run("try", home=tmp)
+        conn = sqlite3.connect(os.path.join(tmp, "earnloop.db"))
+        conn.execute("INSERT OR REPLACE INTO opportunities(id,source,title,url,budget,body,score,scams,staged_at,outcome)"
+                     " VALUES('gh-1','github-issues','App crashes on empty csv',"
+                     "'https://github.com/x/y/issues/1','help-wanted','',5,'[]',NULL,'open')")
+        conn.commit(); conn.close()
+        r = run("propose", "gh-1", home=tmp)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("最小", r.stdout)          # issue voice, not bidding voice
+        conn = sqlite3.connect(os.path.join(tmp, "earnloop.db"))
+        who = conn.execute("SELECT decided_by FROM approvals WHERE opportunity_id='gh-1'"
+                           " AND action='staged'").fetchone()[0]
+        conn.close()
+        self.assertEqual(who, "agent")            # staging is the agent's act, never 'human'
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_doctor_warns_on_missing_github_token(self):
+        import shutil, tempfile
+        tmp = tempfile.mkdtemp()
+        env = dict(os.environ)
+        env.pop("GITHUB_TOKEN", None)
+        env["EARNLOOP_HOME"] = tmp
+        import subprocess
+        r = subprocess.run([sys.executable, os.path.join(HERE, "..", "earnloop.py"), "doctor"],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("WARN", r.stdout)
+        self.assertIn("GITHUB_TOKEN", r.stdout)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

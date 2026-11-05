@@ -46,8 +46,9 @@ import sqlite3
 import sys
 import time
 import urllib.request
+import urllib.parse
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 HOME = os.environ.get("EARNLOOP_HOME") or os.path.expanduser("~/.earnloop")
 DB_PATH = os.path.join(HOME, "earnloop.db")
 JOURNAL_PATH = os.path.join(HOME, "events.jsonl")
@@ -352,6 +353,63 @@ def source_botstreet(cfg_path=None):
 SOURCES = {"botstreet": source_botstreet}
 
 
+# competitor signals actually measured in listing text (review lesson: the
+# README claimed budget-vs-competition scoring while competition was never read)
+COMPETITOR_RE = re.compile(
+    r"(\d{1,4})\s*(?:人|位|个)?\s*(?:已经?)?\s*(?:认领|投标|报名|申请|接单|bids?|applicants?|claimed)", re.I)
+
+
+def extract_competitors(text):
+    """Best (max) competitor count found in a listing's title+body; 0 if none."""
+    n = 0
+    for m in COMPETITOR_RE.finditer(text or ""):
+        try:
+            n = max(n, int(m.group(1)))
+        except ValueError:
+            continue
+    return n
+
+
+# --------------------------------------------------------------------------
+# discovery source: GitHub help-wanted issues (the low-competition door).
+# A bidding board is an auction: N people fight over one post. A help-wanted
+# issue is a door nobody knocks on — the asker wants a fix, most readers only
+# lurk demand boards, so competition is near zero by construction. See DISCOVERY.md.
+# --------------------------------------------------------------------------
+def source_github_issues(cfg=None):
+    q = ('label:help-wanted state:open type:issue -linked:pr -assigned '
+         'no:assignee created:>={since}').format(
+             since=time.strftime("%Y-%m-%d", time.localtime(now() - 14 * 86400)))
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "earnloop"}
+    tok = cfg or os.environ.get("GITHUB_TOKEN")
+    if tok:
+        headers["Authorization"] = "Bearer " + tok
+    try:
+        url = ("https://api.github.com/search/issues?per_page=20&sort=created&order=desc&q="
+               + urllib.parse.quote(q))
+        d = json.loads(urllib.request.urlopen(
+            urllib.request.Request(url, headers=headers), timeout=20).read().decode())
+        out = []
+        for it in d.get("items", []):
+            body = (it.get("body") or "")[:800]
+            out.append({
+                "id": "gh-issue-" + str(it.get("id")),
+                "source": "github-issues",
+                "title": it.get("title") or "",
+                "url": it.get("html_url") or "",
+                # issues carry no bounty by default — price is set by us, not bid
+                "budget": "help-wanted",
+                "body": body,
+            })
+        return out
+    except Exception as e:
+        sys.stderr.write("source github-issues degraded: %s\n" % e)
+        return []
+
+
+SOURCES["github-issues"] = source_github_issues
+
+
 # --------------------------------------------------------------------------
 # commands
 # --------------------------------------------------------------------------
@@ -371,7 +429,8 @@ def cmd_scan(args):
     for r in rows:
         text = (r.get("title", "") + " " + r.get("body", ""))
         scams = scam_check(text)
-        s = score_opp(r.get("budget", ""), r.get("body", ""))
+        rivals = extract_competitors(text)
+        s = score_opp(r.get("budget", ""), r.get("body", ""), rivals)
         if scams:
             s = 0.0
         else:
@@ -384,7 +443,7 @@ def cmd_scan(args):
             " VALUES(?,?,?,?,?,?,?,?,?)",
             (r["id"], r["source"], r["title"], r["url"], r["budget"],
              r["body"], s, json.dumps(scams, ensure_ascii=False), now()))
-        journal_write("scanned", r["id"], "score=%.2f source=%s" % (s, r.get("source", "?")))
+        journal_write("scanned", r["id"], "score=%.2f source=%s rivals=%d" % (s, r.get("source", "?"), rivals))
         added += 1
     conn.commit()
     top = conn.execute(
@@ -405,9 +464,13 @@ def cmd_propose(args):
     if json.loads(row["scams"] or "[]"):
         journal_write("blocked_scam", args.id, row["scams"])
         sys.exit("blocked: this opportunity matched scam patterns %s — see SCAMS.md" % row["scams"])
-    draft = ("你好，看到你的需求「%s」。我的方案：先免费出最小样稿/体检报告，"
-             "你验证后再谈价；数据不出本机、附来源与可复现脚本；验收不合格免费返工。"
-             " %s") % (row["title"], row["url"])
+    if row["source"] == "github-issues":
+        draft = ("看到这个 issue。我可以接手修复：先给一个最小可复现/最小 patch 供你验证，"
+                 "通过后再谈报酬；全程在公开仓库可见，验收不合格不收费。 %s") % row["url"]
+    else:
+        draft = ("你好，看到你的需求「%s」。我的方案：先免费出最小样稿/体检报告，"
+                 "你验证后再谈价；数据不出本机、附来源与可复现脚本；验收不合格免费返工。"
+                 " %s") % (row["title"], row["url"])
     secrets = secret_check(draft)
     if secrets:
         journal_write("blocked_secret", args.id, str(secrets))
@@ -415,8 +478,8 @@ def cmd_propose(args):
                  % [k for k, _ in secrets])
     guard_outreach("staged", args.id)
     conn.execute("UPDATE opportunities SET staged_at=? WHERE id=?", (now(), args.id))
-    conn.execute("INSERT INTO approvals(ts,opportunity_id,action) VALUES(?,?,?)",
-                 (now(), args.id, "staged"))
+    conn.execute("INSERT INTO approvals(ts,opportunity_id,action,decided_by) VALUES(?,?,?,?)",
+                 (now(), args.id, "staged", "agent"))
     conn.commit()
     print("staged (NOT sent). draft:\n---\n%s\n---" % draft)
     print("run: earnloop approve %s   # human consent required before sending" % args.id)
@@ -629,11 +692,19 @@ def cmd_doctor(args):
         src_ok = True
         if name == "botstreet":
             src_ok = os.path.exists(BOTSTREET_ENV)
+        if name == "github-issues" and not os.environ.get("GITHUB_TOKEN"):
+            checks.append(("source github-issues: no GITHUB_TOKEN (rate-limited to ~10 req/min)", "WARN"))
+            continue
         checks.append(("source %s configured" % name, src_ok))
     checks.append(("approver key (%s)" % APPROVER_KEY_ENV, approver_identity() is not None))
     bad = 0
     for name, ok in checks:
-        mark = "OK " if ok is True else ("WARN" if name == "paused" and ok is False else "FAIL")
+        if ok is True:
+            mark = "OK "
+        elif ok == "WARN" or (name == "paused" and ok is False):
+            mark = "WARN"
+        else:
+            mark = "FAIL"
         if ok is False and name != "paused":
             bad += 1
         print("[%s] %s%s" % (mark, name, (" — %s" % ok) if isinstance(ok, str) else ""))

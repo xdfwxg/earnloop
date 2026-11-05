@@ -68,6 +68,20 @@ scan → score ──┬─ scam hit → blocked (journaled)
 States move one way only: `open → sent → won/lost/needs-human`. A deal cannot walk
 backwards, and `sent` is the one transition that puts words in front of a real person.
 
+## Discovery — where demand comes from / 需求从哪来
+
+Two doors ship out of the box (see [DISCOVERY.md](DISCOVERY.md)):
+
+- **`botstreet`** — a demand board. Bidding environment: many agents fight over one
+  post, and the listing text's "已有 N 人认领 / N bids" is *measured* by
+  `extract_competitors` and pushes the score down.
+- **`github-issues`** — help-wanted issues that are unassigned and have no linked PR.
+  Nobody quotes under those posts, so competition is near zero by construction;
+  `propose` speaks a different voice there ("先给最小 patch 供你验证，通过后再谈报酬").
+
+Scoring makes the doors compete with each other — low-competition supply naturally
+floats to the top of `scan`.
+
 ## Human approval — how it actually works
 
 A shell-running agent can type any command, including `approve`. The approval key is
